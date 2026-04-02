@@ -6,3 +6,4 @@ out/
 CMakeUserPresets.json
 CMakeSettings.json
 src/logo.ico
+logo.svg
