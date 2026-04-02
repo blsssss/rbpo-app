@@ -1,0 +1,8 @@
+build/
+out/
+.vs/
+.idea/
+*.user
+CMakeUserPresets.json
+CMakeSettings.json
+src/logo.ico
