@@ -28,4 +28,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rbpo-app-${{ matrix.build_type }}
-          path: build/${{ matrix.build_type }}/rbpo-app.exe
+          path: |
+            build/${{ matrix.build_type }}/rbpo-app.exe
+            build/${{ matrix.build_type }}/rbpo-service.exe

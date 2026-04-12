@@ -30,6 +30,14 @@ endif()
 # ---------------------------------------------------------------------------
 find_program(MIDL_COMPILER midl)
 if(NOT MIDL_COMPILER)
+    # Search in Windows SDK directories (needed in CI where midl is not on PATH)
+    file(GLOB _SDK_BIN_DIRS
+        "C:/Program Files (x86)/Windows Kits/10/bin/10.*/x64"
+        "C:/Program Files (x86)/Windows Kits/10/bin/x64"
+    )
+    find_program(MIDL_COMPILER midl PATHS ${_SDK_BIN_DIRS})
+endif()
+if(NOT MIDL_COMPILER)
     message(FATAL_ERROR "MIDL compiler not found. Install the Windows SDK.")
 endif()
 
