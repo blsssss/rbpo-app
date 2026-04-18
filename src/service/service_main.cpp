@@ -224,7 +224,7 @@ static void WINAPI ServiceMain(DWORD, LPWSTR*)
         for (DWORD i = 0; i < sessionCount; i++) {
             Log("  Session %u: id=%u state=%d",
                 i, pSessions[i].SessionId, pSessions[i].State);
-            if (pSessions[i].State == WTSActive && pSessions[i].SessionId != 0)
+            if (pSessions[i].State == pSessions[i].SessionId != 0)
                 LaunchAppInSession(pSessions[i].SessionId);
         }
         WTSFreeMemory(pSessions);
