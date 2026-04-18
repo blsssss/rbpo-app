@@ -1,127 +1,140 @@
-# РБПО — Tray Application
+# РБПО — Windows Service + Tray Application
 
-Графическое приложение для Windows с иконкой в области уведомлений (трей), реализованное на **C++ / Win32 API** с системой сборки **CMake**.
+Windows-служба и графическое приложение (трей), взаимодействующие через **Windows RPC** с транспортом **ALPC**. Реализовано на **C++17 / Win32 API**, система сборки — **CMake**.
 
 ## Структура проекта
 
 ```
 rbpo-app/
-├── CMakeLists.txt              # Сборка CMake
-├── logo.png                    # Логотип приложения
+├── CMakeLists.txt                  # Сборка CMake (GUI + Service + MIDL)
+├── logo.png                        # Логотип приложения
 ├── scripts/
-│   └── convert_icon.ps1        # Конвертация PNG → ICO (PowerShell)
+│   └── convert_icon.ps1            # Конвертация PNG → ICO (PowerShell)
 ├── src/
-│   ├── main.cpp                # Основной исходный код
-│   ├── resource.h              # Идентификаторы ресурсов
-│   └── app.rc                  # Файл ресурсов (иконка, меню)
+│   ├── main.cpp                    # GUI-приложение (tray)
+│   ├── resource.h                  # Идентификаторы ресурсов
+│   ├── app.rc                      # Файл ресурсов (иконка, меню)
+│   ├── rbpo_rpc_constants.h        # Общие константы (имена, endpoint)
+│   ├── rpc/
+│   │   ├── rbpo_rpc.idl            # IDL-описание RPC-интерфейса
+│   │   └── rbpo_rpc.acf            # ACF (implicit binding handle)
+│   └── service/
+│       └── service_main.cpp        # Windows-служба
 └── README.md
 ```
 
 ## Сборка
 
+Сборка выполняется из **Developer Command Prompt for VS** (чтобы `midl.exe` был доступен):
+
 ```bash
-cmake -B build -G "Ninja" 
+cmake -B build -G "Ninja"
 cmake --build build --config Release
 ```
 
-> При первом запуске CMake автоматически конвертирует `logo.png` → `src/logo.ico` с помощью PowerShell-скрипта `scripts/convert_icon.ps1`.
+> При первом запуске CMake автоматически конвертирует `logo.png` → `src/logo.ico`.
 
-Собранный исполняемый файл: `build/Release/rbpo-app.exe`
+Результат сборки:
+- `build/rbpo-app.exe` — графическое приложение
+- `build/rbpo-service.exe` — Windows-служба
 
-### Запуск
+## Регистрация и запуск службы
 
-```bash
-# Обычный запуск (главное окно показывается)
-./build/Release/rbpo-app.exe
+```powershell
+# Регистрация службы (от имени администратора)
+sc.exe create RBPOService binPath= "C:\полный\путь\к\rbpo-service.exe" start= demand
 
-# Скрытый запуск (только иконка в трее)
-./build/Release/rbpo-app.exe --silent
+# Запуск / остановка
+sc.exe start RBPOService
+# Остановка выполняется через RPC (из GUI-приложения)
+
+# Удаление службы
+sc.exe delete RBPOService
 ```
 
 ---
 
-## Реализация требований
+## Реализация требований к Windows-службе
 
-### 1. Иконка в области уведомлений при запуске
+### С-1. Запуск GUI во всех терминальных сессиях (кроме сессии 0)
 
-Функция `AddTrayIcon()` вызывается в `wWinMain` сразу после создания окна. Используется `Shell_NotifyIconW(NIM_ADD, ...)`.
+При старте служба перечисляет активные сессии (`WTSEnumerateSessionsW`) и запускает `rbpo-app.exe --silent` в каждой (кроме 0) от имени владельца сессии (`WTSQueryUserToken` + `CreateProcessAsUserW`). Главное окно скрыто.
 
-- [`src/main.cpp:91-92`](src/main.cpp#L91-L92) — вызов `AddTrayIcon` при старте
-- [`src/main.cpp:211-224`](src/main.cpp#L211-L224) — реализация `AddTrayIcon()`
+- [`src/service/service_main.cpp`](src/service/service_main.cpp) — `LaunchAppInSession()`, вызов в `ServiceMain()`
 
-### 2. Клик ЛКМ по иконке → показ главного окна
+### С-2. Отслеживание входов новых пользователей
 
-Обработка `WM_LBUTTONUP` в callback-сообщении `WM_TRAYICON`.
+Служба принимает `SERVICE_CONTROL_SESSIONCHANGE` / `WTS_SESSION_LOGON` и запускает GUI в новой сессии.
 
-- [`src/main.cpp:131-134`](src/main.cpp#L131-L134) — обработка левого клика
-- [`src/main.cpp:251-256`](src/main.cpp#L251-L256) — реализация `ShowMainWindow()`
+- [`src/service/service_main.cpp`](src/service/service_main.cpp) — `ServiceCtrlHandlerEx()`, обработка `WTS_SESSION_LOGON`
 
-### 3. Клик ПКМ по иконке → контекстное меню
+### С-3. Отключение обработки Stop и Shutdown
 
-Обработка `WM_RBUTTONUP` — вызов `ShowTrayContextMenu()`, которая создаёт popup-меню через `CreatePopupMenu` / `TrackPopupMenu`.
+В `dwControlsAccepted` не устанавливаются флаги `SERVICE_ACCEPT_STOP` и `SERVICE_ACCEPT_SHUTDOWN`. Обработчик возвращает `NO_ERROR` без каких-либо действий.
 
-- [`src/main.cpp:135-138`](src/main.cpp#L135-L138) — обработка правого клика
-- [`src/main.cpp:232-248`](src/main.cpp#L232-L248) — реализация `ShowTrayContextMenu()`
+- [`src/service/service_main.cpp`](src/service/service_main.cpp) — `ServiceCtrlHandlerEx()`, ветки `SERVICE_CONTROL_STOP` / `SERVICE_CONTROL_SHUTDOWN`
 
-### 4. Пункт «Открыть» в контекстном меню
+### С-4. RPC-сервер (ALPC)
 
-Пункт добавляется через `AppendMenuW` с идентификатором `ID_TRAY_OPEN`. При клике вызывается `ShowMainWindow()`.
+Служба регистрирует транспорт `ncalrpc` с endpoint `RBPOServiceEndpoint` и вызывает `RpcServerListen` (блокирующий). Служба работает до вызова `RpcMgmtStopServerListening`.
 
-- [`src/main.cpp:238`](src/main.cpp#L238) — добавление пункта «Открыть»
-- [`src/main.cpp:145-148`](src/main.cpp#L145-L148) — обработка `ID_TRAY_OPEN`
-- [`src/resource.h:11`](src/resource.h#L11) — определение `ID_TRAY_OPEN`
+- [`src/service/service_main.cpp`](src/service/service_main.cpp) — `ServiceMain()`, секция RPC
+- [`src/rpc/rbpo_rpc.idl`](src/rpc/rbpo_rpc.idl) — IDL-описание интерфейса
+- [`src/rpc/rbpo_rpc.acf`](src/rpc/rbpo_rpc.acf) — ACF с implicit handle
 
-### 5. Пункт «Выход» в контекстном меню
+### С-5. RPC-интерфейс для остановки
 
-Пункт добавляется через `AppendMenuW` с идентификатором `ID_TRAY_EXIT`. При клике вызывается `DestroyWindow()`.
+Интерфейс `RBPOServiceRpc` содержит метод `RBPOService_Stop()`, который вызывает `RpcMgmtStopServerListening`, завершая работу RPC-сервера и службы.
 
-- [`src/main.cpp:240`](src/main.cpp#L240) — добавление пункта «Выход»
-- [`src/main.cpp:149-152`](src/main.cpp#L149-L152) — обработка `ID_TRAY_EXIT`
-- [`src/resource.h:12`](src/resource.h#L12) — определение `ID_TRAY_EXIT`
+- [`src/service/service_main.cpp`](src/service/service_main.cpp) — реализация `RBPOService_Stop()`
 
-### 6. Пересоздание панели задач → повторное добавление иконки
+### С-6. Завершение всех GUI-приложений при остановке
 
-Регистрируется системное сообщение `TaskbarCreated` через `RegisterWindowMessageW`. При получении этого сообщения иконка добавляется заново.
+После возврата из `RpcServerListen` служба вызывает `TerminateProcess` для каждого запущенного дочернего процесса.
 
-- [`src/main.cpp:55-56`](src/main.cpp#L55-L56) — регистрация `WM_TASKBARCREATED`
-- [`src/main.cpp:120-124`](src/main.cpp#L120-L124) — обработка пересоздания панели задач
+- [`src/service/service_main.cpp`](src/service/service_main.cpp) — `TerminateAllChildren()`
 
-### 7. Запуск без показа главного окна
+---
 
-Поддерживается флаг командной строки `--silent`. Окно создаётся скрытым; если флаг не передан — окно показывается.
+## Реализация требований к графическому приложению
 
-- [`src/main.cpp:79-84`](src/main.cpp#L79-L84) — создание окна (изначально скрыто)
-- [`src/main.cpp:94-98`](src/main.cpp#L94-L98) — проверка флага `--silent`
+### GUI-1. Проверка состояния службы при запуске
 
-### 8. Закрытие окна → работа в фоне
+Если служба не запущена, приложение запускает её (`StartServiceW`), ожидает состояния `SERVICE_RUNNING` (до 30 сек) и завершается.
 
-Обработчик `WM_CLOSE` скрывает окно вместо его уничтожения. Приложение продолжает работу в трее.
+- [`src/main.cpp`](src/main.cpp) — `IsServiceRunning()`, `StartServiceAndWait()`, проверка в `wWinMain()`
 
-- [`src/main.cpp:160-163`](src/main.cpp#L160-L163) — перехват `WM_CLOSE`, вызов `HideMainWindow()`
-- [`src/main.cpp:259-262`](src/main.cpp#L259-L262) — реализация `HideMainWindow()`
+### GUI-2. Проверка родительского процесса
 
-### 9. Меню «Файл» → «Выход»
+Приложение определяет PID родительского процесса через `CreateToolhelp32Snapshot` и проверяет имя исполняемого файла (`QueryFullProcessImageNameW`). Если это не `rbpo-service.exe`, приложение завершается.
 
-Меню главного окна определено в файле ресурсов `app.rc` и назначено через `wc.lpszMenuName`. Пункт «Выход» обрабатывается по `ID_FILE_EXIT`.
+- [`src/main.cpp`](src/main.cpp) — `GetParentProcessId()`, `IsParentService()`, проверка в `wWinMain()`
 
-- [`src/app.rc:6-12`](src/app.rc#L6-L12) — определение меню «Файл» → «Выход»
-- [`src/main.cpp:67`](src/main.cpp#L67) — привязка меню к окну
-- [`src/main.cpp:153-156`](src/main.cpp#L153-L156) — обработка `ID_FILE_EXIT`
+### GUI-3. «Выход» в главном меню → остановка службы
 
-### 10. Однократный запуск (single-instance)
+Пункт «Файл → Выход» (`ID_FILE_EXIT`) вызывает `StopServiceViaRpc()` перед `DestroyWindow`.
 
-Используется именованный мьютекс `Local\RBPO_TrayApp_SingleInstance`. При обнаружении повторного запуска приложение завершается **до** создания иконки в трее.
+- [`src/main.cpp`](src/main.cpp) — обработка `ID_FILE_EXIT` в `WndProc()`
 
-- [`src/main.cpp:18`](src/main.cpp#L18) — имя мьютекса
-- [`src/main.cpp:46-51`](src/main.cpp#L46-L51) — проверка и досрочный выход
-- [`src/main.cpp:108-110`](src/main.cpp#L108-L110) — освобождение мьютекса при завершении
+### GUI-4. «Выход» в контекстном меню трея → остановка службы
 
-### 11. Сборка с использованием CMake
+Пункт «Выход» (`ID_TRAY_EXIT`) вызывает `StopServiceViaRpc()` перед `DestroyWindow`.
 
-Проект полностью собирается через CMake. Поддерживаются генераторы Visual Studio, Ninja и NMake.
+- [`src/main.cpp`](src/main.cpp) — обработка `ID_TRAY_EXIT` в `WndProc()`
 
-- [`CMakeLists.txt`](CMakeLists.txt) — полная конфигурация сборки
-- [`scripts/convert_icon.ps1`](scripts/convert_icon.ps1) — автоматическая конвертация иконки
+---
+
+## Межпроцессное взаимодействие (RPC / ALPC)
+
+| Параметр | Значение |
+|----------|----------|
+| Транспорт | `ncalrpc` (ALPC) |
+| Endpoint | `RBPOServiceEndpoint` |
+| Интерфейс | `RBPOServiceRpc` v1.0 |
+| UUID | `A1B2C3D4-E5F6-7890-ABCD-EF1234567890` |
+| Binding | Implicit (`hRBPOServiceBinding`) |
+
+Клиент (GUI) создаёт binding через `RpcStringBindingComposeW` + `RpcBindingFromStringBindingW` и вызывает `RBPOService_Stop()`. Сервер (служба) реализует эту функцию, останавливая RPC-сервер.
 
 ---
 
@@ -130,6 +143,8 @@ cmake --build build --config Release
 | Компонент | Технология |
 |-----------|-----------|
 | Язык | C++17 |
-| API | Win32 API (`windows.h`, `shellapi.h`) |
+| API | Win32 API, WTS API, RPC API |
+| IPC | Windows RPC (ALPC / `ncalrpc`) |
+| IDL | MIDL compiler |
 | Сборка | CMake ≥ 3.20 |
 | Компилятор | MSVC (Visual Studio) |

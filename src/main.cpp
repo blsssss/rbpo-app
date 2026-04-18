@@ -3,6 +3,7 @@
  *
  * Win32 API application with system tray icon support,
  * single-instance enforcement, and background operation.
+ * Communicates with the RBPO Windows Service via RPC (ALPC).
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -10,7 +11,17 @@
 
 #include <windows.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
+#include <cstdlib>
+#include <cstdio>
+#include <cstdarg>
+#include <string>
 #include "resource.h"
+#include "rbpo_rpc_h.h"
+#include "rbpo_rpc_constants.h"
+
+#pragma comment(lib, "rpcrt4.lib")
+#pragma comment(lib, "advapi32.lib")
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -38,11 +49,213 @@ static void ShowTrayContextMenu(HWND hWnd);
 static void ShowMainWindow();
 static void HideMainWindow();
 
+// ---------------------------------------------------------------------------
+// RPC memory allocation (required by the RPC runtime)
+// ---------------------------------------------------------------------------
+void* __RPC_USER midl_user_allocate(size_t size) { return malloc(size); }
+void  __RPC_USER midl_user_free(void* p)         { free(p); }
+
+// ---------------------------------------------------------------------------
+// Diagnostic log — writes to rbpo-app.log next to the exe
+// ---------------------------------------------------------------------------
+static void Log(const char* fmt, ...)
+{
+    static char logPath[MAX_PATH] = {};
+    if (!logPath[0]) {
+        char exePath[MAX_PATH];
+        GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+        std::string p(exePath);
+        auto pos = p.find_last_of("\\/");
+        if (pos != std::string::npos) p = p.substr(0, pos + 1);
+        p += "rbpo-app.log";
+        strncpy_s(logPath, p.c_str(), _TRUNCATE);
+    }
+    FILE* f = nullptr;
+    fopen_s(&f, logPath, "a");
+    if (!f) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(f, fmt, args);
+    va_end(args);
+    fprintf(f, "\n");
+    fclose(f);
+}
+
+// ---------------------------------------------------------------------------
+// Service helpers
+// ---------------------------------------------------------------------------
+
+// Check whether the Windows service is in the RUNNING state
+static bool IsServiceRunning()
+{
+    SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!hSCM) return false;
+
+    SC_HANDLE hSvc = OpenServiceW(hSCM, RBPO_SERVICE_NAME, SERVICE_QUERY_STATUS);
+    if (!hSvc) { CloseServiceHandle(hSCM); return false; }
+
+    SERVICE_STATUS status = {};
+    QueryServiceStatus(hSvc, &status);
+    CloseServiceHandle(hSvc);
+    CloseServiceHandle(hSCM);
+
+    return status.dwCurrentState == SERVICE_RUNNING;
+}
+
+// Start the service and wait until it reaches the RUNNING state (up to 30 s)
+static bool StartServiceAndWait()
+{
+    SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!hSCM) return false;
+
+    SC_HANDLE hSvc = OpenServiceW(hSCM, RBPO_SERVICE_NAME,
+                                   SERVICE_START | SERVICE_QUERY_STATUS);
+    if (!hSvc) { CloseServiceHandle(hSCM); return false; }
+
+    if (!StartServiceW(hSvc, 0, nullptr)) {
+        DWORD err = GetLastError();
+        if (err != ERROR_SERVICE_ALREADY_RUNNING) {
+            CloseServiceHandle(hSvc);
+            CloseServiceHandle(hSCM);
+            return false;
+        }
+    }
+
+    SERVICE_STATUS status = {};
+    for (int i = 0; i < 60; i++) {
+        QueryServiceStatus(hSvc, &status);
+        if (status.dwCurrentState == SERVICE_RUNNING) break;
+        Sleep(500);
+    }
+
+    CloseServiceHandle(hSvc);
+    CloseServiceHandle(hSCM);
+    return status.dwCurrentState == SERVICE_RUNNING;
+}
+
+// Get the parent process ID of the current process
+static DWORD GetParentProcessId()
+{
+    DWORD pid  = GetCurrentProcessId();
+    DWORD ppid = 0;
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return 0;
+
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            if (pe.th32ProcessID == pid) {
+                ppid = pe.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+    return ppid;
+}
+
+// Check if the parent process is the RBPO service
+// Uses Toolhelp32 snapshot (no OpenProcess needed — avoids ACCESS_DENIED on SYSTEM processes)
+static bool IsParentService()
+{
+    DWORD pid  = GetCurrentProcessId();
+    DWORD ppid = 0;
+    wchar_t parentExe[MAX_PATH] = {};
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return false;
+
+    // First pass: find our parent PID
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            if (pe.th32ProcessID == pid) {
+                ppid = pe.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(hSnap, &pe));
+    }
+
+    if (ppid == 0) { CloseHandle(hSnap); return false; }
+
+    // Second pass: find parent's exe name
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            if (pe.th32ProcessID == ppid) {
+                wcscpy_s(parentExe, pe.szExeFile);
+                break;
+            }
+        } while (Process32NextW(hSnap, &pe));
+    }
+
+    CloseHandle(hSnap);
+
+    bool result = (parentExe[0] && _wcsicmp(parentExe, RBPO_SERVICE_EXE_NAME) == 0);
+    Log("  IsParentService: ppid=%u, parentExe='%ls', expected='%ls', match=%d",
+        ppid, parentExe, RBPO_SERVICE_EXE_NAME, result);
+    return result;
+}
+
+// Stop the Windows service via an RPC call over ALPC
+static void StopServiceViaRpc()
+{
+    RPC_WSTR stringBinding = nullptr;
+    RPC_STATUS status = RpcStringBindingComposeW(
+        nullptr,
+        reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(L"ncalrpc")),
+        nullptr,
+        reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(RBPO_RPC_ENDPOINT)),
+        nullptr,
+        &stringBinding);
+
+    if (status != RPC_S_OK) return;
+
+    status = RpcBindingFromStringBindingW(stringBinding, &hRBPOServiceBinding);
+    RpcStringFreeW(&stringBinding);
+
+    if (status != RPC_S_OK) return;
+
+    RpcTryExcept {
+        RBPOService_Stop();
+    }
+    RpcExcept(1) {
+        // RPC call failed — service may already be stopped
+    }
+    RpcEndExcept
+
+    RpcBindingFree(&hRBPOServiceBinding);
+}
+
 // ===========================================================================
 // Entry point
 // ===========================================================================
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int)
 {
+    Log("=== rbpo-app started (PID=%u) ===", GetCurrentProcessId());
+
+    // --- GUI Requirement 1: if the service is stopped, start it and exit ----
+    bool svcRunning = IsServiceRunning();
+    Log("IsServiceRunning = %d", svcRunning);
+    if (!svcRunning) {
+        bool started = StartServiceAndWait();
+        Log("StartServiceAndWait = %d, exiting", started);
+        return 0;
+    }
+
+    // --- GUI Requirement 2: exit if parent is not the service ---------------
+    DWORD ppid = GetParentProcessId();
+    bool parentIsSvc = IsParentService();
+    Log("ParentPID=%u, IsParentService=%d", ppid, parentIsSvc);
+    if (!parentIsSvc) {
+        Log("Parent is not the service, exiting");
+        return 0;
+    }
+
     // --- Requirement 10: single-instance check via named mutex --------------
     g_hMutex = CreateMutexW(nullptr, TRUE, APP_MUTEX_NAME);
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -147,11 +360,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             ShowMainWindow();
             break;
         case ID_TRAY_EXIT:
-            // Requirement 5: "Выход" in tray menu → exit
+            // GUI Requirement 4: "Выход" in tray menu → stop service via RPC
+            StopServiceViaRpc();
             DestroyWindow(hWnd);
             break;
         case ID_FILE_EXIT:
-            // Requirement 9: Файл → Выход → exit
+            // GUI Requirement 3: Файл → Выход → stop service via RPC
+            StopServiceViaRpc();
             DestroyWindow(hWnd);
             break;
         }
